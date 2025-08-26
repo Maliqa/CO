@@ -109,3 +109,165 @@ netstat -tulpn | grep :8577
 Port 8577 seharusnya tidak bentrok dengan aplikasi umum lainnya, jadi seharusnya aman untuk digunakan.
 
 Semua konfigurasi di atas sudah disesuaikan untuk menggunakan port 8577 sesuai permintaan Anda.
+
+
+
+
+import os
+import uuid
+import hashlib
+import sqlite3
+import base64
+import html
+import mimetypes
+import json
+from datetime import datetime, date, time, timedelta
+from typing import Optional, Tuple
+
+import pandas as pd
+import streamlit as st
+import streamlit.components.v1 as components
+
+# Opsional: kalender hari libur nasional
+try:
+    import holidays as pyholidays
+except ImportError:
+    pyholidays = None
+
+# INISIALISASI SESSION STATE DI LEVEL ATAS
+if "initialized" not in st.session_state:
+    st.session_state.update({
+        "initialized": True,
+        "authenticated": False,
+        "user": None
+    })
+
+# -------------------- Konfigurasi --------------------
+DB_PATH = os.environ.get("HRMS_DB_PATH", "hrms.db")
+UPLOAD_DIR = os.environ.get("HRMS_UPLOAD_DIR", "uploads")
+BASE64_SIZE_WARN_BYTES = int(os.environ.get("HRMS_BASE64_WARN_BYTES", 5 * 1024 * 1024))  # 5 MB
+TEXT_PREVIEW_MAX_BYTES = int(os.environ.get("HRMS_TEXT_PREVIEW_MAX_BYTES", 200 * 1024))  # 200 KB
+
+# -------------------- DB Helpers --------------------
+def get_conn():
+    try:
+        db_dir = os.path.dirname(DB_PATH)
+        if db_dir and not os.path.exist(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("PRAGMA foreign_keys = ON;")
+    except Exception:
+        pass
+    return conn
+
+except sqlite3.OperationalError as e:
+    st.error(f"Database error: {e}")
+    st.warning("Using temporary in-memory database. Changes will not persist")
+    return sqlite3.connect(":memory:", check_same_thread=False)
+
+def init_db():
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    conn = get_conn()
+    cur = conn.cursor()
+    # users
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        email TEXT UNIQUE NOT NULL,
+        name TEXT NOT NULL,
+        role TEXT NOT NULL CHECK(role IN ('EMPLOYEE','MANAGER','HR_ADMIN')),
+        manager_id INTEGER,
+        password_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        division TEXT,
+        FOREIGN KEY(manager_id) REFERENCES users(id)
+    );
+    """)
+    # quotas
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS quotas(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        year INTEGER NOT NULL,
+        leave_total INTEGER NOT NULL DEFAULT 12,
+        leave_used INTEGER NOT NULL DEFAULT 0,
+        changeoff_earned INTEGER NOT NULL DEFAULT 0,
+        changeoff_used INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(user_id, year),
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    );
+    """)
+    # requests
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS requests(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        type TEXT NOT NULL CHECK(type IN ('LEAVE','CHANGEOFF')),
+        start_date TEXT,
+        end_date TEXT,
+        single_date TEXT,
+        hours INTEGER,
+        reason TEXT,
+        status TEXT NOT NULL CHECK(status IN ('PENDING_MANAGER','PENDING_HR','APPROVED','REJECTED')),
+        manager_by INTEGER,
+        manager_at TEXT,
+        hr_by INTEGER,
+        hr_at TEXT,
+        timesheet_path TEXT,
+        location TEXT,
+        activity TEXT,
+        pic TEXT,
+        job_execution TEXT,
+        payload_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        file_uploaded BOOLEAN DEFAULT 0,
+        activity_start_time TEXT,
+        activity_end_time TEXT,
+        departure_date TEXT,
+        return_date TEXT,
+        activities_json TEXT,
+        FOREIGN KEY(user_id) REFERENCES users(id),
+        FOREIGN KEY(manager_by) REFERENCES users(id),
+        FOREIGN KEY(hr_by) REFERENCES users(id)
+    );
+    """)
+    conn.commit()
+    add_column_if_missing(conn, "users", "division", "TEXT")
+    add_column_if_missing(conn, "requests", "activities_json", "TEXT")
+    add_column_if_missing(conn, "requests", "file_uploaded", "BOOLEAN DEFAULT 0")
+    add_column_if_missing(conn, "requests", "activity_start_time", "TEXT")
+    add_column_if_missing(conn, "requests", "activity_end_time", "TEXT")
+    add_column_if_missing(conn, "requests", "departure_date", "TEXT")
+    add_column_if_missing(conn, "requests", "return_date", "TEXT")
+    # Seed default users jika kosong
+    cur.execute("SELECT COUNT(1) AS c FROM users;")
+    if cur.fetchone()["c"] == 0:
+        now = datetime.utcnow().isoformat()
+        def hpw(p): return hashlib.sha256(p.encode()).hexdigest()
+        cur.execute("""INSERT INTO users(email,name,role,manager_id,password_hash,created_at,updated_at,division)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    ("manager@example.com", "Manager One", "MANAGER", None, hpw("password"), now, now, "Engineering"))
+        manager_id = cur.lastrowid
+        cur.execute("""INSERT INTO users(email,name,role,manager_id,password_hash,created_at,updated_at,division)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    ("employee@example.com", "Employee One", "EMPLOYEE", manager_id, hpw("password"), now, now, "Engineering"))
+        cur.execute("""INSERT INTO users(email,name,role,manager_id,password_hash,created_at,updated_at,division)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    ("hr@example.com", "HR Admin", "HR_ADMIN", None, hpw("password"), now, now, "Human Resources"))
+        conn.commit()
+        cur.execute("SELECT id FROM users WHERE email=?", ("employee@example.com",))
+        emp_id = cur.fetchone()["id"]
+        year = datetime.utcnow().year
+        cur.execute("""INSERT OR IGNORE INTO quotas(user_id,year,leave_total,leave_used,changeoff_earned,changeoff_used,created_at,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (emp_id, year, 12, 0, 0, 0, now, now))
+        conn.commit()
+    conn.close()
+
