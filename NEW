@@ -25,7 +25,8 @@ if "initialized" not in st.session_state:
         "initialized": True,
         "authenticated": False,
         "user": None,
-        "db_initialized": False  # Tambahan untuk track status database
+        "db_initialized": False,
+        "in_memory_db": False
     })
 
 # -------------------- Konfigurasi --------------------
@@ -48,45 +49,35 @@ def get_conn():
             conn.execute("PRAGMA foreign_keys = ON;")
         except Exception:
             pass
+        
+        # Set flag bahwa kita menggunakan database file
+        st.session_state.in_memory_db = False
         return conn
+        
     except sqlite3.OperationalError as e:
         st.error(f"Database error: {e}")
         # Fallback ke in-memory database untuk emergency
         st.warning("Using temporary in-memory database. Changes will not persist!")
-        # Simpan di session state bahwa kita menggunakan in-memory DB
-        st.session_state.in_memory_db = True
+        
+        # Buat koneksi in-memory
         conn = sqlite3.connect(":memory:", check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        
+        # Set flag bahwa kita menggunakan in-memory database
+        st.session_state.in_memory_db = True
+        st.session_state.db_initialized = False  # Reset flag inisialisasi
+        
+        # Inisialisasi schema untuk in-memory database
+        init_in_memory_db(conn)
+        
         return conn
 
-def add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, col_def: str):
+def init_in_memory_db(conn):
+    """Inisialisasi schema untuk in-memory database"""
     try:
         cur = conn.cursor()
-        cur.execute(f"PRAGMA table_info({table})")
-        cols = [r["name"] for r in cur.fetchall()]
-        if column not in cols:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def};")
-            conn.commit()
-    except Exception as e:
-        st.error(f"Error adding column {column} to {table}: {e}")
-
-def init_db():
-    try:
-        # Cek jika database sudah diinisialisasi
-        if st.session_state.get("db_initialized", False):
-            return True
-            
-        os.makedirs(UPLOAD_DIR, exist_ok=True)
         
-        # Pastikan database directory exists
-        db_dir = os.path.dirname(DB_PATH)
-        if db_dir and not os.path.exists(db_dir):
-            os.makedirs(db_dir, exist_ok=True)
-            
-        conn = get_conn()
-        cur = conn.cursor()
-        
-        # users
+        # users table
         cur.execute("""
         CREATE TABLE IF NOT EXISTS users(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,7 +92,8 @@ def init_db():
             FOREIGN KEY(manager_id) REFERENCES users(id)
         );
         """)
-        # quotas
+        
+        # quotas table
         cur.execute("""
         CREATE TABLE IF NOT EXISTS quotas(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,7 +109,8 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         );
         """)
-        # requests
+        
+        # requests table
         cur.execute("""
         CREATE TABLE IF NOT EXISTS requests(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,6 +145,148 @@ def init_db():
             FOREIGN KEY(hr_by) REFERENCES users(id)
         );
         """)
+        
+        # Seed default users untuk in-memory database
+        cur.execute("SELECT COUNT(1) AS c FROM users;")
+        result = cur.fetchone()
+        count = result[0] if isinstance(result, (list, tuple)) else result['c']
+        
+        if count == 0:
+            now = datetime.utcnow().isoformat()
+            def hpw(p): return hashlib.sha256(p.encode()).hexdigest()
+            
+            # Insert manager
+            cur.execute("""INSERT INTO users(email,name,role,manager_id,password_hash,created_at,updated_at,division)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        ("manager@example.com", "Manager One", "MANAGER", None, hpw("password"), now, now, "Engineering"))
+            manager_id = cur.lastrowid
+            
+            # Insert employee
+            cur.execute("""INSERT INTO users(email,name,role,manager_id,password_hash,created_at,updated_at,division)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        ("employee@example.com", "Employee One", "EMPLOYEE", manager_id, hpw("password"), now, now, "Engineering"))
+            
+            # Insert HR
+            cur.execute("""INSERT INTO users(email,name,role,manager_id,password_hash,created_at,updated_at,division)
+                           VALUES(?,?,?,?,?,?,?,?)""",
+                        ("hr@example.com", "HR Admin", "HR_ADMIN", None, hpw("password"), now, now, "Human Resources"))
+            
+            # Get employee ID untuk quota
+            cur.execute("SELECT id FROM users WHERE email=?", ("employee@example.com",))
+            emp_result = cur.fetchone()
+            if emp_result:
+                emp_id = emp_result[0] if isinstance(emp_result, (list, tuple)) else emp_result['id']
+                year = datetime.utcnow().year
+                cur.execute("""INSERT OR IGNORE INTO quotas(user_id,year,leave_total,leave_used,changeoff_earned,changeoff_used,created_at,updated_at)
+                               VALUES(?,?,?,?,?,?,?,?)""",
+                            (emp_id, year, 12, 0, 0, 0, now, now))
+        
+        conn.commit()
+        st.session_state.db_initialized = True
+        st.info("In-memory database initialized with sample data")
+        
+    except Exception as e:
+        st.error(f"Failed to initialize in-memory database: {e}")
+
+def add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, col_def: str):
+    try:
+        cur = conn.cursor()
+        cur.execute(f"PRAGMA table_info({table})")
+        cols = [r["name"] for r in cur.fetchall()]
+        if column not in cols:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def};")
+            conn.commit()
+    except Exception as e:
+        st.error(f"Error adding column {column} to {table}: {e}")
+
+def init_db():
+    try:
+        # Cek jika database sudah diinisialisasi
+        if st.session_state.get("db_initialized", False):
+            return True
+            
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
+        
+        # Pastikan database directory exists
+        db_dir = os.path.dirname(DB_PATH)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+            
+        conn = get_conn()
+        
+        # Jika menggunakan in-memory database, schema sudah diinisialisasi di get_conn()
+        if st.session_state.in_memory_db:
+            return True
+            
+        cur = conn.cursor()
+        
+        # Buat tabel untuk database file
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('EMPLOYEE','MANAGER','HR_ADMIN')),
+            manager_id INTEGER,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            division TEXT,
+            FOREIGN KEY(manager_id) REFERENCES users(id)
+        );
+        """)
+        
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS quotas(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            year INTEGER NOT NULL,
+            leave_total INTEGER NOT NULL DEFAULT 12,
+            leave_used INTEGER NOT NULL DEFAULT 0,
+            changeoff_earned INTEGER NOT NULL DEFAULT 0,
+            changeoff_used INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, year),
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
+        """)
+        
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS requests(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            type TEXT NOT NULL CHECK(type IN ('LEAVE','CHANGEOFF')),
+            start_date TEXT,
+            end_date TEXT,
+            single_date TEXT,
+            hours INTEGER,
+            reason TEXT,
+            status TEXT NOT NULL CHECK(status IN ('PENDING_MANAGER','PENDING_HR','APPROVED','REJECTED')),
+            manager_by INTEGER,
+            manager_at TEXT,
+            hr_by INTEGER,
+            hr_at TEXT,
+            timesheet_path TEXT,
+            location TEXT,
+            activity TEXT,
+            pic TEXT,
+            job_execution TEXT,
+            payload_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            file_uploaded BOOLEAN DEFAULT 0,
+            activity_start_time TEXT,
+            activity_end_time TEXT,
+            departure_date TEXT,
+            return_date TEXT,
+            activities_json TEXT,
+            FOREIGN KEY(user_id) REFERENCES users(id),
+            FOREIGN KEY(manager_by) REFERENCES users(id),
+            FOREIGN KEY(hr_by) REFERENCES users(id)
+        );
+        """)
+        
         conn.commit()
         
         # Tambahkan kolom jika missing
@@ -163,15 +298,10 @@ def init_db():
         add_column_if_missing(conn, "requests", "departure_date", "TEXT")
         add_column_if_missing(conn, "requests", "return_date", "TEXT")
         
-        # Seed default users jika kosong - PERBAIKAN BAGIAN INI
+        # Seed default users jika kosong
         cur.execute("SELECT COUNT(1) AS c FROM users;")
         result = cur.fetchone()
-        # Handle perbedaan antara sqlite3.Row dan tuple
-        if hasattr(result, '__getitem__'):
-            count = result[0] if isinstance(result, (list, tuple)) else result['c']
-        else:
-            # Fallback untuk in-memory database
-            count = 0
+        count = result[0] if isinstance(result, (list, tuple)) else result['c']
             
         if count == 0:
             now = datetime.utcnow().isoformat()
@@ -213,3 +343,25 @@ def init_db():
     except Exception as e:
         st.error(f"Failed to initialize database: {e}")
         return False
+
+# -------------------- Auth --------------------
+def hash_pw(pw: str) -> str:
+    return hashlib.sha256(pw.encode()).hexdigest()
+
+def login(email: str, password: str) -> Optional[sqlite3.Row]:
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM users WHERE email=?", (email,))
+        row = cur.fetchone()
+        conn.close()
+        
+        if not row: 
+            return None
+        if row["password_hash"] != hash_pw(password): 
+            return None
+        return row
+        
+    except sqlite3.OperationalError as e:
+        st.error(f"Login error: {e}")
+        return None
