@@ -1,0 +1,111 @@
+# Konfigurasi Port 8577 untuk HRMS Streamlit
+
+Bisa banget bro! Gampang tinggal adjust portnya aja. Ini yang perlu diubah:
+
+## 1. Dockerfile
+
+```dockerfile
+FROM python:3.9-slim
+
+# Set working directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    libsqlite3-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements file
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY . .
+
+# Create uploads directory
+RUN mkdir -p uploads
+
+# Expose port 8577
+EXPOSE 8577
+
+# Health check
+HEALTHCHECK CMD curl --fail http://localhost:8577/_stcore/health || exit 1
+
+# Run the application on port 8577
+CMD ["streamlit", "run", "app.py", "--server.port=8577", "--server.address=0.0.0.0"]
+```
+
+## 2. docker-compose.yml
+
+```yaml
+version: '3.8'
+
+services:
+  hrms-app:
+    build: .
+    ports:
+      - "8577:8577"  # Changed to port 8577
+    volumes:
+      - ./uploads:/app/uploads
+      - ./hrms.db:/app/hrms.db
+      - ./.env:/app/.env
+    environment:
+      - HRMS_DB_PATH=/app/hrms.db
+      - HRMS_UPLOAD_DIR=/app/uploads
+    restart: unless-stopped
+```
+
+## 3. Cara Run dengan Docker Langsung
+
+```bash
+# Build image
+docker build -t hrms-app .
+
+# Run container dengan port 8577
+docker run -d -p 8577:8577 \
+  -v $(pwd)/uploads:/app/uploads \
+  -v $(pwd)/hrms.db:/app/hrms.db \
+  -v $(pwd)/.env:/app/.env \
+  --name hrms-container \
+  hrms-app
+```
+
+## 4. Cara Run dengan Docker Compose
+
+```bash
+# Build dan run
+docker-compose up -d
+
+# Hentikan
+docker-compose down
+```
+
+## 5. Setelah Deploy
+
+Akses aplikasi di: `http://localhost:8577` atau `http://your-server-ip:8577`
+
+## 6. Untuk Production/Cloud Deployment
+
+Pastikan untuk:
+1. Buka port 8577 di firewall cloud provider Anda
+2. Update security groups/rules untuk mengizinkan traffic pada port 8577
+3. Jika menggunakan load balancer, arahkan traffic ke port 8577
+
+## 7. Troubleshooting Port
+
+Jika port 8577 sudah digunakan, coba:
+
+```bash
+# Cek proses yang menggunakan port 8577
+sudo lsof -i :8577
+
+# Atau gunakan netstat
+netstat -tulpn | grep :8577
+```
+
+Port 8577 seharusnya tidak bentrok dengan aplikasi umum lainnya, jadi seharusnya aman untuk digunakan.
+
+Semua konfigurasi di atas sudah disesuaikan untuk menggunakan port 8577 sesuai permintaan Anda.
